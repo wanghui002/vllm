@@ -1,4 +1,6 @@
+
 # SPDX-License-Identifier: Apache-2.0
+
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import ClassVar
@@ -6,13 +8,16 @@ from typing import ClassVar
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
+    MLACommonDecodeMetadata,
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -24,14 +29,86 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+from vllm.v1.attention.ops.triton_decode_attention import (
+    _decode_softmax_reducev_fwd,
+    _fwd_grouped_kernel_stage1,
+)
+
+# Tuned per-bucket kernel configs (auto-generated tuning table)
+try:
+    from vllm.v1.attention.backends.mla.triton_mla_tuning import (
+        lookup_config as _lookup_tuned_config,
+    )
+except ImportError:
+    _lookup_tuned_config = None
 
 logger = init_logger(__name__)
 
+# Maximum num_kv_splits the attn_logits pool is allocated for. Each CG bucket
 
-class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+# picks its own `num_kv_splits <= MAX_NUM_KV_SPLITS` (see `_pick_num_kv_splits`)
 
+# and passes a slice `attn_logits[:B, :, :num_kv_splits, :]` to the kernel —
+
+# the slice preserves parent strides so different buckets coexist in the same
+
+# underlying storage. `num_kv_splits` is a Triton `tl.constexpr`, so each
+
+# bucket gets its own compiled kernel; `B` is constant per capture so this is
+
+# CG-safe.
+MAX_NUM_KV_SPLITS = 64
+
+# Legacy constant kept for the VLLM_BATCH_INVARIANT path and as the small-batch
+
+# cap; long-context single-request is still best with 64 splits on sm120 fp8.
+CG_NUM_KV_SPLITS = 64
+
+def _pick_num_kv_splits(B: int, q_num_heads: int) -> int:
+    """Bucket-aware num_kv_splits.
+
+    Target: keep total stage-1 CTAs (B * H_blocks * num_kv_splits) in the
+    3-6x SM-count range on sm120 (144 SMs). BLOCK_H=8, so H_blocks=ceil(H/8).
+    At B=1 we want many splits (bandwidth-bound, long ctx); at B=128 we want
+    few (stage-1 already oversubscribes, stage-2 merge cost scales with splits).
+    """
+    h_blocks = max(1, (q_num_heads + 7) // 8)
+    # Target ~576 stage-1 CTAs (≈4× SM count); round DOWN to power of 2 so
+    # splits never over-shoot. Cap at MAX_NUM_KV_SPLITS (pool shape).
+    target = max(1, 576 // (B * h_blocks))
+    p = 1
+    while (p << 1) <= target:
+        p <<= 1
+    return max(1, min(MAX_NUM_KV_SPLITS, p))
+
+# Persistent CUDA-graph-safe buffers SHARED across all TritonMLAImpl layer
+
+# instances. Layers run sequentially in a forward pass so one buffer is enough
+
+# per (device, shape, dtype) signature. Keyed so a mixed-dtype / multi-device
+
+# deployment still works.
+_SHARED_CG_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+def _get_shared_cg_buffer(
+    key_prefix: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    init_zeros: bool = False,
+) -> torch.Tensor:
+    """Return a persistent CG-safe buffer from the shared module-level pool,
+    allocating it on first use for the given (key_prefix, device, shape,
+    dtype) signature."""
+    key = (key_prefix, device, shape, dtype)
+    buf = _SHARED_CG_BUFFERS.get(key)
+    if buf is None:
+        if init_zeros:
+            buf = torch.zeros(shape, dtype=dtype, device=device)
+        else:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+        _SHARED_CG_BUFFERS[key] = buf
+    return buf
 
 class TritonMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -77,6 +154,177 @@ class TritonMLABackend(MLACommonBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
 
+class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+    # FULL cudagraphs are safe to capture per-batch-size as long as every
+    # replay uses the same num_kv_splits / output buffer addresses. We enforce
+    # both in TritonMLAImpl.forward_mqa (persistent buffers + per-bucket
+    # constexpr configs) and here (per-query block_table / seq_lens written
+    # in-place into persistent cg_buf_*).
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # UNIFORM = all requests in the batch have the same query_len. Combined
+    # with _init_reorder_batch_threshold(supports_spec_as_decode=True), this
+    # makes spec-verify batches (query_len = 1 + num_spec_tokens per request)
+    # route through the decode path instead of the expensive prefill branch.
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+
+    def __init__(self, *args, **kwargs):
+        # Force supports_dcp_with_varlen=True so that
+        # _init_reorder_batch_threshold does NOT override our bumped threshold
+        # back to 1 under DCP>1. Our per-query seq_lens expansion in
+        # _build_decode operates on dcp_local_seq_lens (which the base
+        # build() already passes in when DCP is active), and the Triton MLA
+        # decode kernel reads the per-query local seq_len directly, so the
+        # semantics are well-defined under DCP+spec-verify.
+        kwargs.setdefault("supports_dcp_with_varlen", True)
+        super().__init__(*args, **kwargs)
+
+        # Persistent CUDA-graph-safe buffers for the spec-verify case where the
+        # Triton decode kernel needs per-query block_table rows and seq_lens.
+        # These are populated in _build_decode via `.copy_()` so the addresses
+        # seen by a captured graph stay stable across replays.
+        #
+        # Size: max_num_seqs * reorder_batch_threshold covers the largest
+        # captured cudagraph shape. reorder_batch_threshold was just bumped by
+        # `_init_reorder_batch_threshold(supports_spec_as_decode=True)` to
+        # 1 + num_spec_tokens, so this is (max_num_seqs * (1+num_spec)).
+        max_num_tokens = self.vllm_config.scheduler_config.max_num_seqs * max(
+            1, int(self.reorder_batch_threshold)
+        )
+        block_size = self.kv_cache_spec.block_size
+        max_model_len = self.vllm_config.model_config.max_model_len
+        max_blocks_per_req = (max_model_len + block_size - 1) // block_size
+
+        self._cg_buf_block_table: torch.Tensor | None = None
+        self._cg_buf_seq_lens: torch.Tensor | None = None
+        self._cg_max_num_tokens = max_num_tokens
+        self._cg_max_blocks_per_req = max_blocks_per_req
+        self._cg_enabled = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+
+    def _maybe_lazy_init_cg_bufs(
+        self,
+        device: torch.device,
+        block_table_dtype: torch.dtype,
+        seq_lens_dtype: torch.dtype,
+    ) -> None:
+        """Lazily allocate the persistent CG buffers on first spec-verify
+        build, zero-initialised so unused cells are deterministic page=0."""
+        if self._cg_buf_block_table is None:
+            self._cg_buf_block_table = torch.zeros(
+                (self._cg_max_num_tokens, self._cg_max_blocks_per_req),
+                dtype=block_table_dtype,
+                device=device,
+            )
+            self._cg_buf_seq_lens = torch.zeros(
+                (self._cg_max_num_tokens,),
+                dtype=seq_lens_dtype,
+                device=device,
+            )
+
+    def _build_decode(
+        self,
+        block_table_tensor: torch.Tensor,
+        seq_lens_device: torch.Tensor,
+        max_seq_len: int,
+        query_start_loc_cpu: torch.Tensor,
+        query_start_loc_device: torch.Tensor,
+        num_decode_tokens: int,
+        dcp_tot_seq_lens_device: torch.Tensor | None,
+    ) -> MLACommonDecodeMetadata:
+        num_reqs = seq_lens_device.shape[0]
+        # For pure decode (num_decode_tokens == num_reqs, query_len==1 per req)
+        # block_table already has the right shape and seq_lens is one per query.
+        # The interesting case is spec-verify (num_decode_tokens == num_reqs * qpr
+        # with qpr > 1): the Triton decode kernel indexes block_table with
+        # `cur_batch` (0..num_decode_tokens-1) treating each query as an
+        # independent "request", and loads seq_lens at the same index. So we
+        # expand block_table by repeating each row `qpr` times and derive per-
+        # query seq_lens from the post-step seq_lens_device.
+        if num_decode_tokens > num_reqs and num_reqs > 0:
+            qpr = num_decode_tokens // num_reqs
+            assert num_decode_tokens == num_reqs * qpr, (
+                "TritonMLA decode-path expects uniform query_len per request; "
+                f"got num_decode_tokens={num_decode_tokens}, num_reqs={num_reqs}"
+            )
+
+            self._maybe_lazy_init_cg_bufs(
+                device=block_table_tensor.device,
+                block_table_dtype=block_table_tensor.dtype,
+                seq_lens_dtype=seq_lens_device.dtype,
+            )
+
+            bt_rows = num_decode_tokens
+            bt_cols_src = block_table_tensor.shape[1]
+            assert bt_rows <= self._cg_buf_block_table.shape[0], (
+                f"spec-verify num_decode_tokens={bt_rows} exceeds CG buffer "
+                f"capacity {self._cg_buf_block_table.shape[0]}"
+            )
+            assert bt_cols_src <= self._cg_buf_block_table.shape[1], (
+                f"block_table has {bt_cols_src} columns > CG buffer "
+                f"{self._cg_buf_block_table.shape[1]}"
+            )
+
+            # Expand in-place into CG-stable buffer: row i*qpr+j -> request
+            # i's block_table row (same for every j in 0..qpr-1).
+            for j in range(qpr):
+                self._cg_buf_block_table[j:bt_rows:qpr, :bt_cols_src].copy_(
+                    block_table_tensor
+                )
+
+            # Per-query seq_lens for spec verify (qpr queries per request).
+            # Query j in request i covers KV positions 0..(ctx+j) globally, so
+            # its GLOBAL post-step seq_len is (global_per_req[i] - (qpr-1) + j).
+            #
+            # Under DCP, seq_lens_device passed in is already the LOCAL per-
+            # request length; we cannot derive per-query LOCAL lens linearly
+            # from that because the dcp split is per global position. Instead:
+            # build per-query GLOBAL seq_lens from dcp_tot_seq_lens_device and
+            # run get_dcp_local_seq_lens on them.
+            _arange = torch.arange(
+                qpr,
+                device=seq_lens_device.device,
+                dtype=seq_lens_device.dtype,
+            )
+            if dcp_tot_seq_lens_device is not None and self.dcp_world_size > 1:
+                from vllm.v1.attention.backends.utils import (
+                    get_dcp_local_seq_lens,
+                )
+
+                global_per_query = (
+                    dcp_tot_seq_lens_device.to(seq_lens_device.dtype).unsqueeze(1)
+                    - (qpr - 1)
+                    + _arange
+                ).reshape(-1)
+                expanded = get_dcp_local_seq_lens(
+                    global_per_query,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
+            else:
+                expanded = (
+                    seq_lens_device.unsqueeze(1) - (qpr - 1) + _arange
+                ).reshape(-1)
+            self._cg_buf_seq_lens[:bt_rows].copy_(expanded)
+
+            if dcp_tot_seq_lens_device is not None:
+                dcp_tot_expanded = (
+                    dcp_tot_seq_lens_device.unsqueeze(1) - (qpr - 1) + _arange
+                ).reshape(-1)
+            else:
+                dcp_tot_expanded = None
+
+            return MLACommonDecodeMetadata(
+                block_table=self._cg_buf_block_table[:bt_rows],
+                seq_lens=self._cg_buf_seq_lens[:bt_rows],
+                dcp_tot_seq_lens=dcp_tot_expanded,
+            )
+
+        # Fast path: query_len==1 per request, no expansion needed.
+        return MLACommonDecodeMetadata(
+            block_table=block_table_tensor,
+            seq_lens=seq_lens_device,
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+        )
 
 class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
@@ -132,6 +380,45 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self.supports_quant_query_input = False
 
         self._sm_count = current_platform.num_compute_units()
+        self._use_tuned_config = (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(120)
+            and is_quantized_kv_cache(self.kv_cache_dtype)
+            and _lookup_tuned_config is not None
+        )
+
+        # CG-safe persistent buffers are pulled from the SHARED module-level
+        # pool on first forward_mqa call, so all target layers + draft layers
+        # reuse the same attn_logits / o / lse storage instead of each
+        # owning a huge buffer.
+        vllm_cfg = get_current_vllm_config_or_none()
+        if vllm_cfg is not None:
+            scheduler_cfg = vllm_cfg.scheduler_config
+            # max_num_seqs * (1 + num_spec_tokens) covers spec verify.
+            spec_cfg = vllm_cfg.speculative_config
+            qpr_max = 1 + (
+                spec_cfg.num_speculative_tokens
+                if spec_cfg is not None and spec_cfg.num_speculative_tokens is not None
+                else 0
+            )
+            self._cg_max_tokens: int = scheduler_cfg.max_num_seqs * qpr_max
+            # Also honour the actual cudagraph_capture_sizes max if compilation
+            # config is available (the scheduler max can exceed what CG
+            # actually captures, see max_cudagraph_capture_size).
+            try:
+                cg_max = vllm_cfg.compilation_config.max_cudagraph_capture_size
+                if cg_max is not None:
+                    self._cg_max_tokens = min(self._cg_max_tokens, cg_max)
+            except AttributeError:
+                pass
+            # Used as the tuning-table key (we store the configured max
+            # model_len, since actual seq_len varies per-call and the table
+            # rounds down to the nearest tuned bucket).
+            self._tuning_max_model_len: int = vllm_cfg.model_config.max_model_len
+        else:
+            # conservative fallback; should not happen in a normal serve path
+            self._cg_max_tokens = 512
+            self._tuning_max_model_len = 262144
 
     def forward_mqa(
         self,
@@ -149,67 +436,134 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
         q_num_heads = q.shape[1]
-        o = torch.zeros(
-            B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
-        )
-        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
-        # For batch invariance, use only 1 split to ensure deterministic reduction
+        # Per-bucket tuned kernel config from triton_mla_tuning.TUNED_KV_CONFIGS
+        # keyed on (q_num_heads, max_model_len, B). Falls back to the analytical
+        # heuristic if not tuned. All values become Triton `tl.constexpr` at
+        # kernel launch time → CG-safe (same compiled variant per bucket).
         if envs.VLLM_BATCH_INVARIANT:
-            num_kv_splits = 1
+            kernel_cfg = {
+                "num_kv_splits": 1,
+                "BLOCK_N": 32,
+                "BLOCK_H": 8,
+                "num_stages": 2,
+                "num_warps": 4,
+            }
         else:
-            # Minimum work per split
-            # hardware dependent
-            min_work_per_split = 512
+            kernel_cfg = None
+            if self._use_tuned_config:
+                kernel_cfg = _lookup_tuned_config(
+                    q_num_heads, self._tuning_max_model_len, B
+                )
+            if kernel_cfg is None:
+                kernel_cfg = {
+                    "num_kv_splits": _pick_num_kv_splits(B, q_num_heads),
+                    "BLOCK_N": 32,
+                    "BLOCK_H": 8,
+                    "num_stages": 2,
+                    "num_warps": 4,
+                }
+        num_kv_splits = kernel_cfg["num_kv_splits"]
 
-            ideal_splits = max(1, attn_metadata.max_seq_len // min_work_per_split)
-
-            # use power of 2 to avoid excessive kernel instantiations
-            ideal_splits = triton.next_power_of_2(ideal_splits)
-
-            # Calculate SM-based maximum splits with occupancy multiplier
-            # 2-4x allows multiple blocks per SM for latency hiding
-            # hardware dependent
-            occupancy_multiplier = 2
-            max_splits = self._sm_count * occupancy_multiplier
-            num_kv_splits = min(ideal_splits, max_splits)
-
-        # TODO(lucas) Allocate ahead of time
-        attn_logits = torch.empty(
+        # Pull CG-safe persistent buffers from the shared pool (one set per
+        # (device, dtype, shape) tuple across ALL layers). attn_logits is
+        # always allocated at MAX_NUM_KV_SPLITS so the same storage serves
+        # every bucket; we pass a `[:num_kv_splits]` slice to the kernel.
+        assert B <= self._cg_max_tokens, (
+            f"forward_mqa: B={B} exceeds CG capture max {self._cg_max_tokens}"
+        )
+        o_buf = _get_shared_cg_buffer(
+            "o",
+            (self._cg_max_tokens, q_num_heads, self.kv_lora_rank),
+            q.dtype,
+            q.device,
+        )
+        lse_buf = _get_shared_cg_buffer(
+            "lse",
+            (self._cg_max_tokens, q_num_heads),
+            q.dtype,
+            q.device,
+        )
+        attn_logits_buf = _get_shared_cg_buffer(
+            "attn_logits",
             (
-                B,
+                self._cg_max_tokens,
                 q_num_heads,
-                num_kv_splits,
-                # NOTE: the +1 stores the LogSumExp (LSE) that the stage2
-                # kernel uses to merge partial attention outputs across splits.
+                MAX_NUM_KV_SPLITS,
+                # +1 stores the LSE that stage2 uses to merge partial outs
                 self.kv_lora_rank + 1,
             ),
-            dtype=torch.float32,
-            device=q.device,
+            torch.float32,
+            q.device,
         )
+        o = o_buf[:B]
+        lse = lse_buf[:B]
+        # Slice keeps parent strides — the kernel reads strides from this view
+        # and ignores the rest of the pool. This is what makes bucket-dependent
+        # num_kv_splits CG-safe.
+        attn_logits = attn_logits_buf[:B, :, :num_kv_splits, :]
 
         # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
-        # Run MQA — always pass layer scales. When KV cache is
-        # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
-        decode_attention_fwd(
+        # Inlined stage-1 + stage-2 decode attention so we can pass tuned
+        # BLOCK_N / BLOCK_H / num_stages / num_warps per bucket. block_table
+        # and seq_lens are already per-query for spec verify (expanded by
+        # TritonMLAMetadataBuilder._build_decode into CG-safe buffers) or
+        # per-request for pure decode.
+        Lk = kv_c_and_k_pe_cache.shape[-1]
+        Lv = kv_c_cache.shape[-1]
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        kv_group_num = q_num_heads  # MLA: single latent KV head
+        block_table = attn_metadata.decode.block_table
+        seq_lens = attn_metadata.decode.seq_lens
+        grid_s1 = (
+            B,
+            triton.cdiv(q_num_heads, min(kernel_cfg["BLOCK_H"], kv_group_num)),
+            num_kv_splits,
+        )
+        _fwd_grouped_kernel_stage1[grid_s1](
             q,
             kv_c_and_k_pe_cache,
-            kv_c_cache,
-            o,
-            lse,
-            attn_metadata.decode.block_table,
-            attn_metadata.decode.seq_lens,
-            attn_logits,
-            num_kv_splits,
+            kv_c_and_k_pe_cache,
             self.scale,
-            PAGE_SIZE,
-            k_scale=layer._k_scale,
-            v_scale=layer._k_scale,
-            is_mla=True,
+            block_table,
+            seq_lens,
+            attn_logits,
+            block_table.stride(0),
+            q.stride(0),
+            q.stride(1),
+            kv_c_and_k_pe_cache.stride(-3),
+            kv_c_and_k_pe_cache.stride(-2),
+            kv_c_and_k_pe_cache.stride(-3),
+            kv_c_and_k_pe_cache.stride(-2),
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            layer._k_scale,
+            layer._k_scale,
+            kv_group_num=kv_group_num,
+            q_head_num=q_num_heads,
+            BLOCK_DMODEL=self.kv_lora_rank,
+            BLOCK_DPE=self.qk_rope_head_dim,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_N=kernel_cfg["BLOCK_N"],
+            BLOCK_H=kernel_cfg["BLOCK_H"],
+            NUM_KV_SPLITS=num_kv_splits,
+            PAGE_SIZE=PAGE_SIZE,
+            logit_cap=0.0,
+            num_warps=kernel_cfg["num_warps"],
+            num_stages=kernel_cfg["num_stages"],
+            Lk=Lk,
+            Lv=Lv,
+            IS_MLA=True,
+        )
+        # Stage 2 merge: defaults (num_warps=4, num_stages=2) are fine,
+        # cost is ~10% of stage-1 so not a tuning target in phase 1.
+        _decode_softmax_reducev_fwd(
+            attn_logits, q, o, lse, kv_c_cache, seq_lens, num_kv_splits
         )
 
         return o, lse
