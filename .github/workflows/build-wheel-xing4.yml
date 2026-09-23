@@ -11,42 +11,27 @@ permissions:
 
 concurrency:
   group: wheel-xing4
-  cancel-in-progress: true
+  cancel-in-progress: false # 绝不取消正在编译的任务
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # 临时云服务器上注册的 self-hosted runner（标签 vllm-builder）
+    runs-on: [self-hosted, linux, x64, vllm-builder]
     timeout-minutes: 360
     env:
       CUDA_HOME: /usr/local/cuda-13.0
       RELEASE_TAG: vllm-xing4.0-py312-cu130
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /opt/google-cloud-cli \
-            /usr/local/share/boost || true
-          df -h /
-
-      - name: Install CUDA 13.0 toolkit
-        run: |
-          set -euxo pipefail
-          wget -q \
-            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-            -O /tmp/cuda-keyring.deb
-          sudo dpkg -i /tmp/cuda-keyring.deb
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            --no-install-recommends cuda-toolkit-13-0
-          echo "${CUDA_HOME}/bin" >> "${GITHUB_PATH}"
-          export PATH="${CUDA_HOME}/bin:${PATH}"
-          nvcc --version
-
       - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Setup toolchain paths
+        run: |
+          echo "${CUDA_HOME}/bin" >> "${GITHUB_PATH}"
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+          nvcc --version
+          ccache --version
+          cargo --version
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -56,18 +41,18 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euxo pipefail
-          rustc --version
           python -m pip install -U pip
           pip install -r requirements/build/cuda.txt
 
       - name: Build wheel
+        # 不设 MAX_JOBS：setup.py 默认使用机器全部 CPU（临时大机器全速编译）
         env:
-          # 标准 runner 内存有限，限制并行编译任务数，避免链接时 OOM
-          MAX_JOBS: "3"
           NVCC_THREADS: "1"
         run: |
           set -euxo pipefail
+          ccache -z
           python -m build --wheel --no-isolation -o dist
+          ccache -s
           ls -lh dist
 
       - name: Inspect wheel contents
