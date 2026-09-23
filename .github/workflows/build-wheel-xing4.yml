@@ -1,0 +1,101 @@
+name: Build vLLM wheel (Xing4.0)
+
+# 推送到 support_xing4_0 分支时自动构建；也支持在 Actions 页面手动触发
+on:
+  push:
+    branches: [support_xing4_0]
+  workflow_dispatch:
+
+permissions:
+  contents: write # 用于创建 GitHub Release 并上传 wheel
+
+concurrency:
+  group: wheel-xing4
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CUDA_HOME: /usr/local/cuda-13.0
+      RELEASE_TAG: vllm-xing4.0-py312-cu130
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/google-cloud-cli \
+            /usr/local/share/boost || true
+          df -h /
+
+      - name: Install CUDA 13.0 toolkit
+        run: |
+          set -euxo pipefail
+          wget -q \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+            -O /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends cuda-toolkit-13-0
+          echo "${CUDA_HOME}/bin" >> "${GITHUB_PATH}"
+          nvcc --version
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          rustc --version
+          python -m pip install -U pip
+          pip install -r requirements/build/cuda.txt
+
+      - name: Build wheel
+        env:
+          # 标准 runner 内存有限，限制并行编译任务数，避免链接时 OOM
+          MAX_JOBS: "3"
+          NVCC_THREADS: "1"
+        run: |
+          set -euxo pipefail
+          python -m build --wheel --no-isolation -o dist
+          ls -lh dist
+
+      - name: Inspect wheel contents
+        run: python -m zipfile -l dist/*.whl | head -20
+
+      - name: Upload wheel to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          WHEEL=$(ls dist/*.whl)
+          printf '%s\n' \
+            '## vLLM wheel for Xing4.0' \
+            '' \
+            '- 源码分支：`support_xing4_0`（同步自 zyp2014/vllm）' \
+            '- Python：3.12 ｜ CUDA：13.0 ｜ torch：2.13.0' \
+            '- 在 Ubuntu 24.04 (glibc 2.39) 上构建，要求测试机 glibc >= 2.39' \
+            '' \
+            '### 安装' \
+            '' \
+            '```bash' \
+            'pip install ./<wheel文件名> --extra-index-url https://flashinfer.ai/whl/' \
+            '```' \
+            > /tmp/release-notes.md
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${WHEEL}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${WHEEL}" \
+              --title "vLLM wheel for Xing4.0 (py3.12 / CUDA 13.0)" \
+              --notes-file /tmp/release-notes.md
+          fi
+          gh release view "${RELEASE_TAG}"
