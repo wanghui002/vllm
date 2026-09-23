@@ -77,21 +77,12 @@ jobs:
             '- 源码分支：`support_xing4_0`（同步自 zyp2014/vllm）' \
             '- Python：3.12 ｜ CUDA：13.0 ｜ torch：2.13.0' \
             '' \
-            '### 运行环境' \
-            '' \
-            '建议直接在官方 CUDA 13 nightly 镜像里安装，依赖已基本对齐：' \
+            '### 用法' \
             '' \
             '```bash' \
-            'docker run --gpus all -it --rm vllm/vllm-openai:nightly-dev-x86_64-cu13-5ee73d9 bash' \
-            '```' \
-            '' \
-            '### 安装' \
-            '' \
-            '```bash' \
-            'python -m pip install --force-reinstall --no-deps --no-cache-dir \\' \
-            '  flashinfer-python==0.6.18.post1 flashinfer-cubin==0.6.18.post1 \\' \
-            '  --extra-index-url https://flashinfer.ai/whl/' \
-            'python -m pip install ./<wheel文件名> --extra-index-url https://flashinfer.ai/whl/' \
+            'docker run --gpus all -it --rm vllm/vllm-openai:v0.30.0 bash' \
+            'pip install ./<wheel文件名>' \
+            'vllm serve <模型路径>' \
             '```' \
             > /tmp/release-notes.md
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
