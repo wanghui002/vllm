@@ -88,7 +88,7 @@ jobs:
             '### 安装' \
             '' \
             '```bash' \
-            'python -m pip install --upgrade --force-reinstall --no-cache-dir \\' \
+            'python -m pip install --force-reinstall --no-deps --no-cache-dir \\' \
             '  flashinfer-python==0.6.18.post1 flashinfer-cubin==0.6.18.post1 \\' \
             '  --extra-index-url https://flashinfer.ai/whl/' \
             'python -m pip install ./<wheel文件名> --extra-index-url https://flashinfer.ai/whl/' \
