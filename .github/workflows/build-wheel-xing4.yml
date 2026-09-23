@@ -21,6 +21,10 @@ jobs:
     env:
       CUDA_HOME: /usr/local/cuda-13.0
       RELEASE_TAG: vllm-xing4.0-py312-cu130
+      # ccache 缓存在构建机本地持久化，重跑/重启后已编译单元自动命中
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime,file_macro,locale
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -46,11 +50,13 @@ jobs:
           pip install -r requirements/build/cuda.txt
 
       - name: Build wheel
-        # 不设 MAX_JOBS：setup.py 默认使用机器全部 CPU（临时大机器全速编译）
         env:
+          # 留 4 核给 runner 心跳/系统，避免满载导致失联
+          MAX_JOBS: "12"
           NVCC_THREADS: "1"
         run: |
           set -euxo pipefail
+          ccache -M 30G
           ccache -z
           python -m build --wheel --no-isolation -o dist
           ccache -s
