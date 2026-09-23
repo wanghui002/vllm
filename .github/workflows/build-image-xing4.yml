@@ -57,8 +57,8 @@ jobs:
 
       - name: Build wheel
         env:
-          # 留 4 核给 runner 心跳/系统，避免满载导致失联
-          MAX_JOBS: "12"
+          # 冷构建（无 ccache）内存尖峰很大，留足余量给 runner 心跳/系统
+          MAX_JOBS: "8"
           NVCC_THREADS: "1"
         run: |
           set -euxo pipefail
