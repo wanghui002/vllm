@@ -42,6 +42,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             --no-install-recommends cuda-toolkit-13-0
           echo "${CUDA_HOME}/bin" >> "${GITHUB_PATH}"
+          export PATH="${CUDA_HOME}/bin:${PATH}"
           nvcc --version
 
       - name: Checkout source
