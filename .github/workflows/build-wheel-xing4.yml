@@ -76,16 +76,27 @@ jobs:
             '' \
             '- 源码分支：`support_xing4_0`（同步自 zyp2014/vllm）' \
             '- Python：3.12 ｜ CUDA：13.0 ｜ torch：2.13.0' \
-            '- 在 Ubuntu 24.04 (glibc 2.39) 上构建，要求测试机 glibc >= 2.39' \
+            '' \
+            '### 运行环境' \
+            '' \
+            '建议直接在官方 CUDA 13 nightly 镜像里安装，依赖已基本对齐：' \
+            '' \
+            '```bash' \
+            'docker run --gpus all -it --rm vllm/vllm-openai:nightly-dev-x86_64-cu13-5ee73d9 bash' \
+            '```' \
             '' \
             '### 安装' \
             '' \
             '```bash' \
-            'pip install ./<wheel文件名> --extra-index-url https://flashinfer.ai/whl/' \
+            'python -m pip install --upgrade --force-reinstall --no-cache-dir \\' \
+            '  flashinfer-python==0.6.18.post1 flashinfer-cubin==0.6.18.post1 \\' \
+            '  --extra-index-url https://flashinfer.ai/whl/' \
+            'python -m pip install ./<wheel文件名> --extra-index-url https://flashinfer.ai/whl/' \
             '```' \
             > /tmp/release-notes.md
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${WHEEL}" --clobber
+            gh release edit "${RELEASE_TAG}" --notes-file /tmp/release-notes.md
           else
             gh release create "${RELEASE_TAG}" "${WHEEL}" \
               --title "vLLM wheel for Xing4.0 (py3.12 / CUDA 13.0)" \
