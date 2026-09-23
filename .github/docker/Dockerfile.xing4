@@ -1,0 +1,7 @@
+# 在官方镜像基础上叠加本地编译好的 wheel，避免在容器里重新编译 vLLM。
+# 基础镜像不带后缀 = 官方默认的 CUDA 13.0 构建，依赖与本 wheel 匹配。
+FROM vllm/vllm-openai:v0.30.0
+
+COPY *.whl /tmp/wheels/
+RUN pip install --no-cache-dir /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels
